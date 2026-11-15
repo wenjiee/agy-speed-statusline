@@ -9,11 +9,15 @@ import sqlite3
 import struct
 import subprocess
 import sys
+import tempfile
 import unicodedata
 
 UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 MODEL_EFFORT_RE = re.compile(r"^(.+?)\s*\((Low|Medium|High|XHigh|Max)\)\s*$", re.I)
+MODE_ARG_RE = re.compile(r"--mode(?:=|\s+)(\S+)")
+MODE_TOKEN_RE = re.compile(r"[A-Za-z0-9._+-]{1,32}")
+SKIP_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
 
 RST = "\x1b[0m"
 DIM = "\x1b[2m"
@@ -100,12 +104,60 @@ def parse_pb_duration(blob: bytes) -> float:
     return sec + nanos / 1e9
 
 
-def extract_metrics(conv_id: str):
+def _candidate_cli_dirs(transcript_path: str = ""):
+    """Yield candidate CLI roots in priority order: env, transcript ancestry, known defaults."""
+    candidates = []
+
+    env_dir = os.environ.get("AGY_CLI_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+
+    # Walk up from the transcript so unusual install layouts still resolve.
+    if transcript_path:
+        try:
+            start = Path(transcript_path).expanduser()
+            if not start.is_dir():
+                start = start.parent
+            candidates.append(start)
+            candidates.extend(start.parents)
+        except (OSError, ValueError, RuntimeError):
+            pass
+
+    home = Path.home()
+    candidates.append(home / ".gemini" / "antigravity-cli")
+    candidates.append(home / ".gemini" / "antigravity")
+
+    seen = set()
+    for cand in candidates:
+        try:
+            key = os.path.normcase(str(cand))
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        yield cand
+
+
+def _find_cli_dir(conv_id: str, transcript_path: str = ""):
+    """Return the CLI root whose conversations/<conv_id>.db exists, else None."""
+    for cand in _candidate_cli_dirs(transcript_path):
+        try:
+            if (cand / "conversations" / f"{conv_id}.db").is_file():
+                return cand
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def extract_metrics(conv_id: str, transcript_path: str = ""):
     """Return (latest_ttft, latest_tps, avg_ttft, avg_tps) across turns in conv_id."""
     if not conv_id or not UUID_RE.fullmatch(conv_id):
         return None, None, None, None
 
-    cli_dir = Path(os.environ.get("AGY_CLI_DIR") or Path.home() / ".gemini" / "antigravity-cli")
+    cli_dir = _find_cli_dir(conv_id, transcript_path)
+    if cli_dir is None:
+        return None, None, None, None
     db_path = cli_dir / "conversations" / f"{conv_id}.db"
     if not db_path.is_file():
         return None, None, None, None
@@ -168,13 +220,26 @@ def extract_metrics(conv_id: str):
     return latest_ttft, latest_tps, avg_ttft, avg_tps
 
 
-def detect_mode(payload: dict) -> str:
-    """Detect permission/execution mode label matching built-in statusLine."""
-    for key in ("mode", "permission_mode"):
-        val = payload.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
+def _normalize_mode(raw: str) -> str:
+    """Trim quotes/whitespace around a CLI mode token; reject anything unusable."""
+    mode = (raw or "").strip().strip("\"'").rstrip(",;")
+    return mode if MODE_TOKEN_RE.fullmatch(mode) else ""
 
+
+def _parse_mode_args(args: str) -> str:
+    """Extract the mode from a process command line (shared by POSIX and Windows)."""
+    if not args:
+        return ""
+    if SKIP_PERMISSIONS_FLAG in args:
+        return "auto"
+    m = MODE_ARG_RE.search(args)
+    if m:
+        return _normalize_mode(m.group(1))
+    return ""
+
+
+def _detect_mode_posix() -> str:
+    """Walk the parent process chain with ps to find the agy invocation."""
     try:
         pid = str(os.getppid())
         for _ in range(4):
@@ -200,6 +265,170 @@ def detect_mode(payload: dict) -> str:
     except Exception:
         pass
     return ""
+
+
+def _windows_process_table() -> dict:
+    """Snapshot pid -> (ppid, exe_name) via kernel32; empty dict on any failure."""
+    if os.name != "nt":
+        return {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+        MAX_PATH = 260
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * MAX_PATH),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == INVALID_HANDLE_VALUE:
+            return {}
+        table = {}
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                table[int(entry.th32ProcessID)] = (
+                    int(entry.th32ParentProcessID),
+                    str(entry.szExeFile),
+                )
+                ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(snap))
+        return table
+    except Exception:
+        return {}
+
+
+def _windows_parent_chain(table: dict, start_pid: int, max_hops: int = 6):
+    """Return [(pid, exe_name)] walking parents upward, at most max_hops deep."""
+    chain = []
+    seen = set()
+    pid = start_pid
+    while pid and pid not in seen and len(chain) < max_hops:
+        info = table.get(pid)
+        if not info:
+            break
+        seen.add(pid)
+        ppid, name = info
+        chain.append((pid, name))
+        pid = ppid
+    return chain
+
+
+def _mode_cache_path(pid: int) -> Path:
+    """Lightweight per-pid cache so we do not cold-start PowerShell on every refresh."""
+    return Path(tempfile.gettempdir()) / f"agy_sl_mode_{pid}.txt"
+
+
+def _read_mode_cache(path: Path) -> str:
+    try:
+        if path.is_file():
+            return _normalize_mode(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def _write_mode_cache(path: Path, mode: str) -> None:
+    try:
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(mode, encoding="utf-8")
+        os.replace(tmp, path)
+    except (OSError, ValueError):
+        pass
+
+
+def _windows_command_line(pid: int) -> str:
+    """Ask PowerShell for a process command line; empty string on any failure."""
+    if not pid:
+        return ""
+    script = f'(Get-CimInstance Win32_Process -Filter "ProcessId={int(pid)}").CommandLine'
+    for exe in ("powershell.exe", "pwsh.exe"):
+        try:
+            proc = subprocess.run(
+                [exe, "-NoProfile", "-NonInteractive", "-Command", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                timeout=1.5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return (proc.stdout or b"").decode("utf-8", "replace")
+        except Exception:
+            continue
+    return ""
+
+
+def _detect_mode_windows() -> str:
+    """Walk the parent chain on Windows, using a temp cache to stay fast."""
+    try:
+        start_pid = os.getppid()
+        if not isinstance(start_pid, int) or start_pid <= 0:
+            return ""
+
+        table = _windows_process_table()
+        chain = _windows_parent_chain(table, start_pid)
+
+        target_pid = None
+        for pid, name in chain:
+            if "agy" in (name or "").lower():
+                target_pid = pid
+                break
+        if target_pid is None:
+            target_pid = chain[0][0] if chain else start_pid
+        if not target_pid:
+            return ""
+
+        cache_path = _mode_cache_path(target_pid)
+        cached = _read_mode_cache(cache_path)
+        if cached:
+            return cached
+
+        mode = _parse_mode_args(_windows_command_line(target_pid))
+        if mode:
+            _write_mode_cache(cache_path, mode)
+        return mode
+    except Exception:
+        return ""
+
+
+def detect_mode(payload: dict) -> str:
+    """Detect permission/execution mode label matching built-in statusLine."""
+    for key in ("mode", "permission_mode"):
+        val = payload.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    try:
+        if os.name == "nt":
+            return _detect_mode_windows()
+        return _detect_mode_posix()
+    except Exception:
+        return ""
 
 
 def format_right(payload: dict) -> str:
@@ -249,7 +478,18 @@ def render_mid(l_ttft, l_tps, a_ttft=None, a_tps=None, full=True) -> str:
     return RST.join(f"{style}{text}" for style, text in segs) + RST
 
 
+def _configure_stdio() -> None:
+    """Force UTF-8 on stdin/stdout so Windows consoles (gbk/cp1252) never choke on 均/│/·."""
+    for stream in (sys.stdin, sys.stdout):
+        try:
+            if stream is not None and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main():
+    _configure_stdio()
     raw = sys.stdin.read()
     try:
         payload = json.loads(raw) if raw.strip() else {}
@@ -258,14 +498,14 @@ def main():
     if not isinstance(payload, dict):
         payload = {}
 
+    tpath = str(payload.get("transcript_path") or "")
     conv_id = str(payload.get("conversation_id") or "").strip()
     if not conv_id:
-        tpath = str(payload.get("transcript_path") or "")
         m = UUID_RE.search(tpath)
         if m:
             conv_id = m.group(0)
 
-    l_ttft, l_tps, a_ttft, a_tps = extract_metrics(conv_id)
+    l_ttft, l_tps, a_ttft, a_tps = extract_metrics(conv_id, tpath)
 
     left = "? for shortcuts"
     right = format_right(payload)

@@ -12,7 +12,9 @@
 - **不破坏原生底栏**：1:1 还原 `? for shortcuts` 与 `auto · Model · effort` 原生配色（`auto` 保持 `#F9AB00` 琥珀金，其余保持 `#9AA0A6`）。
 - **双色层级**：分隔符 `·`、`│`、`均` 暗灰弱化，首字延迟浅青，吐字速度亮白。
 - **自动响应式**：窄屏（如 80 列）自动降级为单轮格式 `4.0s · 507 t/s`，不换行不遮挡。
-- **直读本地只读库**：以 `?mode=ro` 只读打开 `~/.gemini/antigravity-cli/conversations/<conversation_id>.db` 的 `gen_metadata` protobuf（支持 `AGY_CLI_DIR` 环境变量覆盖）。
+- **跨平台**：macOS / Linux / Windows 都能跑。Windows 下用 `ctypes` 遍历父进程链定位 `agy`，命中结果写到临时文件缓存，避免每次刷新都冷启动 PowerShell 拖慢终端。
+- **编码安全**：启动时把 `stdin` / `stdout` 切到 UTF-8（`errors="replace"`），Windows 控制台默认 `gbk` / `cp1252` 也不会因为 `均`、`│`、`·` 报错。
+- **直读本地只读库**：以 `?mode=ro` 只读打开 `conversations/<conversation_id>.db` 的 `gen_metadata` protobuf。根目录按 `AGY_CLI_DIR` 环境变量 → `transcript_path` 向上回溯 → `~/.gemini/antigravity-cli` → `~/.gemini/antigravity` 的顺序查找，只认真正存在 `conversations/<conversation_id>.db` 的那一个。
 
 ## 指标计算方式
 
@@ -21,7 +23,7 @@
 
 ## 使用方法
 
-1. 克隆仓库并赋予执行权限：
+1. 克隆仓库并赋予执行权限（Windows 不需要 `chmod`）：
 
 ```bash
 git clone https://github.com/wenjiee/agy-speed-statusline.git
@@ -35,6 +37,17 @@ chmod +x agy-speed-statusline/statusline.py
   "statusLine": {
     "type": "command",
     "command": "python3 /path/to/agy-speed-statusline/statusline.py"
+  }
+}
+```
+
+Windows 上 `command` 请写 `python` 而不是 `python3`（Windows 官方安装包只提供 `python.exe`），路径用双反斜杠或正斜杠：
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "python C:\\path\\to\\agy-speed-statusline\\statusline.py"
   }
 }
 ```
